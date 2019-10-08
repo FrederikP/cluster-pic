@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+
+import argparse
+import imghdr
+import logging
+import math
+import ntpath
+import os
+import sys
+
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor as PoolExecutor
+from datetime import datetime
+from multiprocessing import cpu_count
+from shutil import copyfile
+from time import time, sleep
+from threading import Thread
+
+import hdbscan
+import numpy as np
+import progressbar
+
+from exif import Image
+from geopy.distance import distance
+from joblib import parallel_backend
+from munch import Munch
+from scipy.spatial.distance import pdist, squareform
+
+
+DATE_FORMAT = '%Y:%m:%d %H:%M:%S'
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument('source_folder', help="Folder that will be recursively searched for pictures.")
+parser.add_argument('target_folder', help="Folder where files will be copied. Will be created if it does not exist.")
+parser.add_argument('-w', '--workers', type=int, default=cpu_count(), help="Maximum number of workers to use for concurrent execution.")
+parser.add_argument('-l', '--loglevel', type=str, default='info', choices=['critial', 'error', 'warning', 'info', 'debug'])
+
+args = parser.parse_args()
+
+logging.root.setLevel(args.loglevel.upper())
+
+target_folder = args.target_folder
+if not os.path.exists(target_folder):
+    os.makedirs(target_folder)
+
+if not os.path.isdir(target_folder):
+    logging.error(f'Target folder {target_folder} needs to be a directory.')
+    sys.exit(1)
+
+nocluster_folder = os.path.join(target_folder, 'nocluster')
+if not os.path.exists(nocluster_folder):
+    os.makedirs(nocluster_folder)
+
+all_images = []
+
+def load_image(filepath):
+    image_format = imghdr.what(filepath)
+    if image_format:
+        image_data = Munch()
+        image_data.path = filepath
+        image_data.format = image_format
+        try:
+            with open(filepath, 'rb') as image_file:
+                exif_data = Image(image_file)
+                try:
+                    lat = exif_data.gps_latitude
+                    image_data.lat = lat[0] + lat[1] / 60 + lat[2] / 3600
+                    lon = exif_data.gps_longitude
+                    image_data.lon = lon[0] + lon[1] / 60 + lon[2] / 3600
+                except AttributeError:
+                    logging.debug(f'No gps position found in metadata in file {filepath}. {dir(exif_data)}')
+                    image_data.lat = None
+                    image_data.lon = None
+                image_data.timestamp = None
+                for key in ['datetime_original', 'datetime', 'gps_timestamp']:
+                    try:
+                        parsed_datetime = datetime.strptime(exif_data[key], DATE_FORMAT)
+                        image_data.timestamp = parsed_datetime.timestamp()
+                        break
+                    except AttributeError:
+                        pass
+                    except (ValueError, TypeError):
+                        logging.debug(f'Key: {key} Value: {exif_data[key]} could not be parsed as datetime.', exc_info=True)
+                if not image_data.timestamp:
+                    logging.debug(f'No timestamp found in metadata in file {filepath}. {dir(exif_data)}')
+        except (AssertionError, KeyError):
+            image_data.timestamp = None
+            image_data.lan = None
+            image_data.lat = None
+            logging.debug(f'Error during metadata extraction in file {filepath}', exc_info=True)
+        return image_data
+
+start_extraction = time()
+logging.info(f'Starting to extract metadata using a pool of {args.workers} worker processes.')
+
+with PoolExecutor(max_workers=args.workers) as executor:
+    for folder, subfolders, filenames in os.walk(args.source_folder):
+        filepaths = [os.path.join(folder, filename) for filename in filenames]
+        all_images.extend([entry for entry in executor.map(load_image, filepaths) if entry is not None])
+
+logging.info(f'Done extracting metadata from images. Took: {time() - start_extraction:.2f}')
+
+images_with_metadata = []
+
+stats = Counter()
+
+for image in all_images:
+    if image.lat and image.lon and image.timestamp:
+        images_with_metadata.append(image)
+        stats.update(['timestamp-and-gps'])
+    elif image.timestamp:
+        date_label = datetime.utcfromtimestamp(image.timestamp).strftime('%Y-%m')
+        date_folder = os.path.join(nocluster_folder, date_label)
+        if not os.path.exists(date_folder):
+            os.makedirs(date_folder)
+        copyfile(image.path, os.path.join(date_folder, ntpath.basename(image.path)))
+        stats.update(['only-timestamp'])
+    else:
+        date_folder = os.path.join(nocluster_folder, "NODATE")
+        if not os.path.exists(date_folder):
+            os.makedirs(date_folder)
+        copyfile(image.path, os.path.join(date_folder, ntpath.basename(image.path)))
+        stats.update(['no-metadata-or-error'])
+
+logging.info(f'Metadata stats: {stats}')
+
+images_with_metadata = sorted(images_with_metadata, key=lambda image: image.timestamp)
+
+last_timestamp = None
+cut_before_indices = []
+for idx, image in enumerate(images_with_metadata):
+    if last_timestamp and (image.timestamp - last_timestamp) / 86400 > 7:
+        cut_before_indices.append(idx)
+    last_timestamp = image.timestamp
+
+split_arrays = np.split(images_with_metadata, cut_before_indices)
+
+for split_array in split_arrays:
+    if len(split_array) < 10:
+        start_day = datetime.utcfromtimestamp(split_array[0].timestamp).strftime('%Y-%m-%d')
+        end_day = datetime.utcfromtimestamp(split_array[-1].timestamp).strftime('%Y-%m-%d')
+        if start_day == end_day:
+            date_label = f'{start_day}'
+        else:
+            date_label = f'{start_day}_{end_day}'
+        date_folder = os.path.join(nocluster_folder, date_label)
+        if not os.path.exists(date_folder):
+            os.makedirs(date_folder)
+        for image in split_array:
+            copyfile(image.path, os.path.join(date_folder, ntpath.basename(image.path)))
+        continue
+
+    vector_array = np.array([[image.lat, image.lon, image.timestamp] for image in split_array])
+
+    start_extraction = time()
+    logging.info(f'Starting to compute distance matrix.')
+
+    n = len(vector_array)
+    total_comparisons = n * (n - 1) / 2
+    number_of_comparisons = 0
+
+    def update_bar():
+        with progressbar.ProgressBar(max_value=total_comparisons) as bar:
+            while number_of_comparisons < total_comparisons:
+                bar.update(number_of_comparisons)
+                sleep(1)
+
+    bar_thread = Thread(target = update_bar)
+    bar_thread.start()
+
+    def get_distance(imageA, imageB):
+        global number_of_comparisons
+        number_of_comparisons = number_of_comparisons + 1
+        distance_in_km = distance((imageA[0], imageA[1]), (imageB[0], imageB[1])).kilometers
+        timedelta_in_hours = abs(imageA[2] - imageB[2]) / 3600
+        return distance_in_km + timedelta_in_hours
+
+    distance_matrix = squareform(pdist(vector_array, metric=get_distance))
+    bar_thread.join()
+
+    clusterer = hdbscan.HDBSCAN(metric='precomputed', min_samples=1, min_cluster_size=10, allow_single_cluster=True)
+    clusterer.fit(distance_matrix)
+
+    clusters = {}
+    for idx, label in enumerate(clusterer.labels_):
+        if label not in clusters:
+            clusters[label] = []
+        clusters[label].append(split_array[idx])
+
+    sorted_clusters = {}
+    for label, image_array in clusters.items():
+        sorted_clusters[label] = sorted(image_array, key=lambda image: image.timestamp)
+    
+    for label, image_array in sorted_clusters.items():
+        start_day = datetime.utcfromtimestamp(image_array[0].timestamp).strftime('%Y-%m-%d')
+        end_day = datetime.utcfromtimestamp(image_array[-1].timestamp).strftime('%Y-%m-%d')
+        if start_day == end_day:
+            date_label = f'{start_day}'
+        else:
+            date_label = f'{start_day}_{end_day}'
+        label_folder = os.path.join(target_folder, str(label))
+        if not os.path.exists(label_folder):
+            os.makedirs(label_folder)
+        date_folder = os.path.join(label_folder, date_label)
+        if not os.path.exists(date_folder):
+            os.makedirs(date_folder)
+        for image in image_array:
+            copyfile(image.path, os.path.join(date_folder, ntpath.basename(image.path)))
